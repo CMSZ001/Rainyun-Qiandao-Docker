@@ -380,6 +380,49 @@ def load_cookies(driver, account_id):
         logger.warning(f"加载 Cookie 失败: {e}")
         return False
 
+def _human_track(dx, dy, steps=None):
+    """ease-out 拆分位移，返回逐段 [(step_x, step_y), ...]，末段补齐取整误差"""
+    steps = steps or max(4, min(14, int(max(abs(dx), abs(dy)) ** 0.5)))
+    weights = [(steps - i) ** 1.5 for i in range(steps)]
+    total = sum(weights)
+
+    track, moved_x, moved_y, acc = [], 0, 0, 0.0
+    for w in weights:
+        acc += w
+        to_x, to_y = round(dx * acc / total), round(dy * acc / total)
+        track.append((to_x - moved_x, to_y - moved_y))
+        moved_x, moved_y = to_x, to_y
+    track[-1] = (track[-1][0] + dx - moved_x, track[-1][1] + dy - moved_y)
+    return track
+
+def click_captcha_point(driver, slide_bg, offset_x, offset_y):
+    """点击验证码图片内的 (offset_x, offset_y)；offset 相对元素左上角，分多段移动避免瞬移被判为脚本"""
+    from selenium.webdriver import ActionChains
+
+    try:
+        width, height = driver.execute_script(
+            "const r = arguments[0].getBoundingClientRect();"
+            "return [r.width, r.height];", slide_bg)
+        if width <= 0 or height <= 0:
+            logger.warning(f"验证码图片尺寸异常: {width}x{height}，跳过点击")
+            return False
+
+        # move_to_element 把光标放在元素中心，所以偏移量相对中心算，不能用视口的 left/top
+        dx = int(offset_x - width / 2)
+        dy = int(offset_y - height / 2)
+
+        actions = ActionChains(driver)
+        actions.move_to_element(slide_bg)
+        for step_x, step_y in _human_track(dx, dy):
+            if step_x or step_y:
+                actions.move_by_offset(step_x, step_y)
+            actions.pause(random.uniform(0.01, 0.03))
+        actions.click().perform()
+        return True
+    except Exception as e:
+        logger.warning(f"点击验证码坐标失败: {e}")
+        return False
+
 def process_captcha(driver, wait, attempt=1, max_attempts=3):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
@@ -391,7 +434,7 @@ def process_captcha(driver, wait, attempt=1, max_attempts=3):
         wait.until(EC.presence_of_element_located((By.ID, "slideBg")))
     except TimeoutException:
         logger.info("未检测到可处理验证码内容，跳过验证码处理")
-        return
+        return False
 
     work_dir = captcha_work_dir()
     download_captcha_img(driver, wait, work_dir)
@@ -415,40 +458,40 @@ def process_captcha(driver, wait, attempt=1, max_attempts=3):
             captcha = cv2.imread(os.path.join(work_dir, "captcha.jpg"))
             raw_w, raw_h = captcha.shape[1], captcha.shape[0]
             
-            final_x = int(x / raw_w * bg_width - bg_width / 2)
-            final_y = int(y / raw_h * bg_height - bg_height / 2)
-            
-            from selenium.webdriver import ActionChains
-            ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
+            target_x = x / raw_w * bg_width
+            target_y = y / raw_h * bg_height
+
+            if not click_captcha_point(driver, slideBg, target_x, target_y):
+                logger.error("验证码坐标点击失败，跳过提交并刷新重试")
+                break
             if i < len(positions) - 1:
                 # 拟人间隔，避免连续点击被判定为脚本
                 time.sleep(random.uniform(0.4, 0.9))
-        
-        confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
-        logger.info("提交验证码")
-        confirm.click()
-        time.sleep(5)
-        result = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
-        if result.get_attribute("class") == 'tc-opera pointer show-success':
-            logger.info("验证码通过")
-            return
         else:
+            confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
+            logger.info("提交验证码")
+            confirm.click()
+            time.sleep(5)
+            result = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
+            if result.get_attribute("class") == 'tc-opera pointer show-success':
+                logger.info("验证码通过")
+                return True
             logger.error("验证码未通过，正在重试")
     else:
         logger.error("验证码识别失败，正在重试")
     
     if attempt >= max_attempts:
         logger.error(f"验证码连续 {attempt} 次未通过，放弃本次验证码处理")
-        return
+        return False
 
     logger.info(f"刷新验证码后重试（{attempt + 1}/{max_attempts}）")
     try:
         driver.find_element(By.XPATH, '//*[@id="reload"]').click()
     except Exception as e:
         logger.error(f"刷新验证码失败，放弃本次验证码处理: {e}")
-        return
+        return False
     time.sleep(5)
-    process_captcha(driver, wait, attempt + 1, max_attempts)
+    return process_captcha(driver, wait, attempt + 1, max_attempts)
 
 def captcha_work_dir():
     # 每个线程就是一个签到账号，验证码图片按线程隔离，避免并发互相覆盖
@@ -618,13 +661,23 @@ def run_checkin(account_user=None, account_pwd=None):
             state = wait_captcha_or_modal(driver, timeout)
             if state == "captcha":
                 logger_adapter.info("处理验证码")
+                captcha_ok = False
                 try:
                     captcha_iframe = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "iframe[id^='tcaptcha_iframe']")))
                     driver.switch_to.frame(captcha_iframe)
-                    process_captcha(driver, wait)
+                    captcha_ok = process_captcha(driver, wait)
                 finally:
                     driver.switch_to.default_content()
                 driver.implicitly_wait(5)
+                if not captcha_ok:
+                    logger_adapter.error("签到验证码未通过，本次未签到")
+                    return {
+                        'status': False,
+                        'msg': '签到验证码未通过',
+                        'points': 0,
+                        'username': masked_user,
+                        'retries': retry_stats['count']
+                    }
             else:
                 logger_adapter.info("未触发验证码")
         else:
