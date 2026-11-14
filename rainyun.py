@@ -380,7 +380,7 @@ def load_cookies(driver, account_id):
         logger.warning(f"加载 Cookie 失败: {e}")
         return False
 
-def process_captcha(driver, wait):
+def process_captcha(driver, wait, attempt=1, max_attempts=3):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.wait import WebDriverWait
@@ -393,9 +393,11 @@ def process_captcha(driver, wait):
         logger.info("未检测到可处理验证码内容，跳过验证码处理")
         return
 
-    download_captcha_img(driver, wait)
-    
-    positions = ICR.find_part_positions("temp/captcha.jpg", "temp/sprite.jpg", 'template')
+    work_dir = captcha_work_dir()
+    download_captcha_img(driver, wait, work_dir)
+
+    positions = ICR.find_part_positions(os.path.join(work_dir, "captcha.jpg"),
+                                        os.path.join(work_dir, "sprite.jpg"), 'template')
     
     if positions:
         logger.info(f"识别到 {len(positions)} 个图案位置")
@@ -410,7 +412,7 @@ def process_captcha(driver, wait):
             bg_height = float(re.search(r'height:\s*([\d.]+)px', style).group(1))
             
             import cv2
-            captcha = cv2.imread("temp/captcha.jpg")
+            captcha = cv2.imread(os.path.join(work_dir, "captcha.jpg"))
             raw_w, raw_h = captcha.shape[1], captcha.shape[0]
             
             final_x = int(x / raw_w * bg_width - bg_width / 2)
@@ -418,6 +420,9 @@ def process_captcha(driver, wait):
             
             from selenium.webdriver import ActionChains
             ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
+            if i < len(positions) - 1:
+                # 拟人间隔，避免连续点击被判定为脚本
+                time.sleep(random.uniform(0.4, 0.9))
         
         confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
         logger.info("提交验证码")
@@ -432,20 +437,33 @@ def process_captcha(driver, wait):
     else:
         logger.error("验证码识别失败，正在重试")
     
-    reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
-    time.sleep(5)
-    reload.click()
-    time.sleep(5)
-    process_captcha(driver, wait)
+    if attempt >= max_attempts:
+        logger.error(f"验证码连续 {attempt} 次未通过，放弃本次验证码处理")
+        return
 
-def download_captcha_img(driver, wait):
+    logger.info(f"刷新验证码后重试（{attempt + 1}/{max_attempts}）")
+    try:
+        driver.find_element(By.XPATH, '//*[@id="reload"]').click()
+    except Exception as e:
+        logger.error(f"刷新验证码失败，放弃本次验证码处理: {e}")
+        return
+    time.sleep(5)
+    process_captcha(driver, wait, attempt + 1, max_attempts)
+
+def captcha_work_dir():
+    # 每个线程就是一个签到账号，验证码图片按线程隔离，避免并发互相覆盖
+    path = os.path.join("temp", f"captcha_{threading.get_ident()}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def download_captcha_img(driver, wait, work_dir="temp"):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.wait import WebDriverWait
-    
-    if os.path.exists("temp"):
-        for filename in os.listdir("temp"):
-            file_path = os.path.join("temp", filename)
+
+    if os.path.isdir(work_dir):
+        for filename in os.listdir(work_dir):
+            file_path = os.path.join(work_dir, filename)
             if os.path.isfile(file_path) or os.path.islink(file_path):
                 os.remove(file_path)
     
@@ -458,17 +476,17 @@ def download_captcha_img(driver, wait):
     img1_style = slideBg.get_attribute("style")
     img1_url = get_url_from_style(img1_style)
     logger.info("开始下载验证码图片(1): " + img1_url)
-    download_image(img1_url, "captcha.jpg", user_agent=current_ua)
+    download_image(img1_url, "captcha.jpg", user_agent=current_ua, dest_dir=work_dir)
     
     sprite = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="instruction"]/div/img')))
     img2_url = sprite.get_attribute("src")
     logger.info("开始下载验证码图片(2): " + img2_url)
-    download_image(img2_url, "sprite.jpg", user_agent=current_ua)
+    download_image(img2_url, "sprite.jpg", user_agent=current_ua, dest_dir=work_dir)
 
-def download_image(url, filename, user_agent=None):
+def download_image(url, filename, user_agent=None, dest_dir="temp"):
     import requests
-    
-    os.makedirs("temp", exist_ok=True)
+
+    os.makedirs(dest_dir, exist_ok=True)
     
     headers = {}
     if user_agent:
@@ -477,7 +495,7 @@ def download_image(url, filename, user_agent=None):
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
-            path = os.path.join("temp", filename)
+            path = os.path.join(dest_dir, filename)
             with open(path, "wb") as f:
                 f.write(response.content)
             return True
