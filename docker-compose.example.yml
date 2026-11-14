@@ -1,0 +1,30 @@
+# 用法：cp docker-compose.example.yml docker-compose.yml && 填入账号 && docker compose run --rm rainyun-sign
+services:
+  rainyun-sign:
+    image: ghcr.io/cmsz001/rainyun-qiandao-docker:latest
+    container_name: rainyun-sign
+    # 跑完一次即退出，定时交给宿主机 cron：
+    #   0 4 * * * cd /path/to/repo && docker compose run --rm rainyun-sign
+    restart: "no"
+    # headless Chrome 默认只用 64MB /dev/shm，多账户并发容易崩溃
+    shm_size: 1g
+    environment:
+      # 多账户用 | 块标量，一行一个，用户名与密码顺序需对应
+      RAINYUN_USER: |-
+        user1
+        user2
+      RAINYUN_PASS: |-
+        pass1
+        pass2
+      # 以下均为镜像默认值，需要时按 .github/workflows/rainyun-sign.yml 覆盖
+      # MAX_WORKERS: "2"
+      # NOTIFY_ONLY_FAILURE: "false"
+      # PUSH_PLUS_TOKEN: ""
+      # SMTP_SERVER: ""
+      # DD_BOT_TOKEN: ""
+    volumes:
+      # 命名卷只持久化 Cookie（跳过验证码），避免 bind mount 产生的 root 屬主目录
+      - rainyun-cookies:/app/temp/cookies
+
+volumes:
+  rainyun-cookies:

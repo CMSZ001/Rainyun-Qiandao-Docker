@@ -1,0 +1,15 @@
+.git
+.git.bak
+.github
+temp
+cookies
+__pycache__
+*.pyc
+.env
+chromedriver
+chromedriver.exe
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+docker-compose*.yml
